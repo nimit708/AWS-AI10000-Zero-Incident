@@ -1,0 +1,8 @@
+{
+  "incident_id": "test-001",
+  "event_type": "EC2 CPU Spike",
+  "severity": "high",
+  "resource_id": "i-test123",
+  "description": "Test incident for deployment verification",
+  "timestamp": 1708729200
+}

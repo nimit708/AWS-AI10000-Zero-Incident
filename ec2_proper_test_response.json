@@ -1,0 +1,4 @@
+{
+  "statusCode": 200,
+  "body": "{\"success\": true, \"incident_id\": \"8427b94c-18a3-4c39-815b-b31e5db7f0c5\", \"routing_path\": \"structured_path\", \"routing_reason\": \"No similar incident found in knowledge base\", \"confidence\": 0.0, \"remediation_success\": null, \"processing_time_seconds\": 0.195015}"
+}

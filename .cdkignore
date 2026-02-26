@@ -1,0 +1,66 @@
+# CDK asset ignore patterns
+# Exclude from Lambda deployment packages
+
+# Tests
+tests/
+*.pyc
+__pycache__/
+.pytest_cache/
+
+# Documentation
+*.md
+TASK_*.md
+TASKS_*.md
+DEPLOYMENT.md
+README.md
+
+# CDK and infrastructure
+infrastructure/
+app.py
+cdk.json
+cdk.out/
+*.js
+*.ts
+node_modules/
+package.json
+package-lock.json
+
+# Deployment scripts
+deploy.sh
+deploy.ps1
+destroy.sh
+*.ps1
+*.sh
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Kiro
+.kiro/
+
+# Python virtual environments
+venv/
+env/
+.env
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# CDK requirements (not needed in Lambda)
+cdk-requirements.txt
+
+# Config files
+pytest.ini
+.flake8
+.pylintrc
+mypy.ini

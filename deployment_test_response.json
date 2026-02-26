@@ -1,0 +1,4 @@
+{
+  "statusCode": 500,
+  "body": "{\"success\": false, \"error\": \"Internal processing error\", \"details\": \"RoutingService.route_incident() missing 1 required positional argument: 'agent_response'\"}"
+}

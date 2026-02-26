@@ -1,0 +1,11 @@
+{
+  "source": "cloudwatch",
+  "timestamp": "2024-02-23T23:00:00Z",
+  "raw_payload": {
+    "incident_id": "test-001",
+    "event_type": "EC2 CPU Spike",
+    "severity": "high",
+    "resource_id": "i-test123",
+    "description": "Test incident for deployment verification"
+  }
+}
