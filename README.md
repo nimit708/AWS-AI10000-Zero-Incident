@@ -90,6 +90,5 @@ pytest --cov=src --cov-report=html
 
 Follow the implementation tasks in `.kiro/specs/aws-incident-management/tasks.md`
 
-## License
 
-MIT
+
