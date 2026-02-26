@@ -1,0 +1,866 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Incident Management System with AI-powered remediation'
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Default: sharmanimit18@outlook.com
+    Description: Email address for incident notifications
+  
+  BedrockAgentModel:
+    Type: String
+    Default: anthropic.claude-3-5-sonnet-20241022-v2:0
+    Description: Bedrock model for AI agent
+  
+  BedrockEmbeddingModel:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+    Description: Bedrock embedding model
+  
+  BedrockSummaryModel:
+    Type: String
+    Default: anthropic.claude-3-haiku-20240307-v1:0
+    Description: Bedrock model for summaries
+
+Resources:
+  # DynamoDB Tables
+  IncidentTrackingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: incident-tracking-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: incident_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: event_type
+          AttributeType: S
+      KeySchema:
+        - AttributeName: incident_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: EventTypeIndex
+          KeySchema:
+            - AttributeName: event_type
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  ResourceLockTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: resource-lock-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: resource_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: resource_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # S3 Bucket
+  KnowledgeBaseBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'incident-kb-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # SNS Topics
+  IncidentSummaryTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: incident-summary-topic
+      DisplayName: Incident Summary Notifications
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+
+  IncidentUrgentTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: incident-urgent-topic
+      DisplayName: Incident Urgent Alerts
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+
+  # SQS Dead Letter Queue
+  IncidentDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: incident-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeout: 300  # 5 minutes
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: IncidentManagementLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt IncidentTrackingTable.Arn
+                  - !Sub '${IncidentTrackingTable.Arn}/index/*'
+                  - !GetAtt ResourceLockTable.Arn
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt KnowledgeBaseBucket.Arn
+                  - !Sub '${KnowledgeBaseBucket.Arn}/*'
+        - PolicyName: SNSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref IncidentSummaryTopic
+                  - !Ref IncidentUrgentTopic
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeAgent
+                  - bedrock:Retrieve
+                Resource: '*'
+        - PolicyName: RemediationAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:StopInstances
+                  - ec2:StartInstances
+                  - ec2:ModifyInstanceAttribute
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:DescribeAutoScalingInstances
+                  - autoscaling:SetDesiredCapacity
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:UpdateFunctionConfiguration
+                  - cloudwatch:GetMetricStatistics
+                  - acm:DescribeCertificate
+                  - acm:RenewCertificate
+                  - ec2:DescribeSecurityGroups
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:DescribeNetworkAcls
+                  - ec2:DescribeRouteTables
+                  - ecs:DescribeServices
+                  - ecs:UpdateService
+                  - ecs:DescribeTasks
+                  - codedeploy:GetDeployment
+                  - codedeploy:StopDeployment
+                Resource: '*'
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt IncidentDLQ.Arn
+        - PolicyName: StepFunctionsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: '*'  # Wildcard to avoid circular dependency
+
+  # IAM Role for Step Functions
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: IncidentManagementStepFunctionsRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt PatternMatcherLambda.Arn
+                  - !GetAtt EC2RemediationLambda.Arn
+                  - !GetAtt LambdaRemediationLambda.Arn
+                  - !GetAtt SSLRemediationLambda.Arn
+                  - !GetAtt NetworkRemediationLambda.Arn
+                  - !GetAtt DeploymentRemediationLambda.Arn
+                  - !GetAtt ServiceRemediationLambda.Arn
+        - PolicyName: SNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref IncidentSummaryTopic
+                  - !Ref IncidentUrgentTopic
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: '*'
+
+  # CloudWatch Log Groups
+  IngestionLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/IngestionLambda
+      RetentionInDays: 7
+
+  DLQProcessorLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/DLQProcessorLambda
+      RetentionInDays: 7
+
+  PatternMatcherLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/PatternMatcherLambda
+      RetentionInDays: 7
+
+  EC2RemediationLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/EC2RemediationLambda
+      RetentionInDays: 7
+
+  LambdaRemediationLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/LambdaRemediationLambda
+      RetentionInDays: 7
+
+  SSLRemediationLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/SSLRemediationLambda
+      RetentionInDays: 7
+
+  NetworkRemediationLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/NetworkRemediationLambda
+      RetentionInDays: 7
+
+  DeploymentRemediationLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/DeploymentRemediationLambda
+      RetentionInDays: 7
+
+  ServiceRemediationLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/ServiceRemediationLambda
+      RetentionInDays: 7
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/states/RemediationStateMachine
+      RetentionInDays: 7
+
+  # NOTE: Lambda functions require code to be uploaded to S3 first
+  # You'll need to:
+  # 1. Create a deployment S3 bucket
+  # 2. Zip your code (excluding tests, docs, etc.)
+  # 3. Upload to S3
+  # 4. Update the S3Bucket and S3Key parameters below
+
+  # Lambda Functions
+  IngestionLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - IngestionLambdaLogGroup
+    Properties:
+      FunctionName: IngestionLambda
+      Runtime: python3.11
+      Handler: lambda_handler.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      DeadLetterConfig:
+        TargetArn: !GetAtt IncidentDLQ.Arn
+      Code:
+        ZipFile: |
+          # Placeholder - Replace with actual deployment package
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': 'Placeholder'}
+      Environment:
+        Variables:
+          INCIDENT_TABLE_NAME: !Ref IncidentTrackingTable
+          RESOURCE_LOCK_TABLE_NAME: !Ref ResourceLockTable
+          KNOWLEDGE_BASE_BUCKET: !Ref KnowledgeBaseBucket
+          SUMMARY_TOPIC_ARN: !Ref IncidentSummaryTopic
+          URGENT_TOPIC_ARN: !Ref IncidentUrgentTopic
+          DLQ_URL: !Ref IncidentDLQ
+          STATE_MACHINE_ARN: !Ref RemediationStateMachine
+          BEDROCK_AGENT_MODEL: !Ref BedrockAgentModel
+          BEDROCK_EMBEDDING_MODEL: !Ref BedrockEmbeddingModel
+          BEDROCK_SUMMARY_MODEL: !Ref BedrockSummaryModel
+
+  DLQProcessorLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - DLQProcessorLambdaLogGroup
+    Properties:
+      FunctionName: DLQProcessorLambda
+      Runtime: python3.11
+      Handler: src.services.graceful_degradation.process_dlq_message
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 180
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          # Placeholder - Replace with actual deployment package
+          def process_dlq_message(event, context):
+              return {'statusCode': 200}
+      Environment:
+        Variables:
+          INCIDENT_TABLE_NAME: !Ref IncidentTrackingTable
+          SUMMARY_TOPIC_ARN: !Ref IncidentSummaryTopic
+          URGENT_TOPIC_ARN: !Ref IncidentUrgentTopic
+
+  DLQEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt IncidentDLQ.Arn
+      FunctionName: !Ref DLQProcessorLambda
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 30
+
+  PatternMatcherLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - PatternMatcherLambdaLogGroup
+    Properties:
+      FunctionName: PatternMatcherLambda
+      Runtime: python3.11
+      Handler: pattern_matcher_handler.evaluate_pattern
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          # Placeholder - Replace with actual deployment package
+          def evaluate_pattern(event, context):
+              return {'pattern': 'Unknown'}
+
+  EC2RemediationLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - EC2RemediationLambdaLogGroup
+    Properties:
+      FunctionName: EC2RemediationLambda
+      Runtime: python3.11
+      Handler: ec2_remediation_handler.remediate
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          # Placeholder - Replace with actual deployment package
+          def remediate(event, context):
+              return {'success': True}
+      Environment:
+        Variables:
+          INCIDENT_TABLE_NAME: !Ref IncidentTrackingTable
+          RESOURCE_LOCK_TABLE_NAME: !Ref ResourceLockTable
+          KNOWLEDGE_BASE_BUCKET: !Ref KnowledgeBaseBucket
+
+  LambdaRemediationLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - LambdaRemediationLambdaLogGroup
+    Properties:
+      FunctionName: LambdaRemediationLambda
+      Runtime: python3.11
+      Handler: lambda_remediation_handler.remediate
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          # Placeholder - Replace with actual deployment package
+          def remediate(event, context):
+              return {'success': True}
+      Environment:
+        Variables:
+          INCIDENT_TABLE_NAME: !Ref IncidentTrackingTable
+          RESOURCE_LOCK_TABLE_NAME: !Ref ResourceLockTable
+          KNOWLEDGE_BASE_BUCKET: !Ref KnowledgeBaseBucket
+
+  SSLRemediationLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - SSLRemediationLambdaLogGroup
+    Properties:
+      FunctionName: SSLRemediationLambda
+      Runtime: python3.11
+      Handler: src.remediation.ssl_certificate_remediation.remediate
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          # Placeholder - Replace with actual deployment package
+          def remediate(event, context):
+              return {'success': True}
+      Environment:
+        Variables:
+          INCIDENT_TABLE_NAME: !Ref IncidentTrackingTable
+          RESOURCE_LOCK_TABLE_NAME: !Ref ResourceLockTable
+          KNOWLEDGE_BASE_BUCKET: !Ref KnowledgeBaseBucket
+
+  NetworkRemediationLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - NetworkRemediationLambdaLogGroup
+    Properties:
+      FunctionName: NetworkRemediationLambda
+      Runtime: python3.11
+      Handler: src.remediation.network_timeout_remediation.remediate
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          # Placeholder - Replace with actual deployment package
+          def remediate(event, context):
+              return {'success': True}
+      Environment:
+        Variables:
+          INCIDENT_TABLE_NAME: !Ref IncidentTrackingTable
+          RESOURCE_LOCK_TABLE_NAME: !Ref ResourceLockTable
+          KNOWLEDGE_BASE_BUCKET: !Ref KnowledgeBaseBucket
+
+  DeploymentRemediationLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - DeploymentRemediationLambdaLogGroup
+    Properties:
+      FunctionName: DeploymentRemediationLambda
+      Runtime: python3.11
+      Handler: src.remediation.deployment_failure_remediation.remediate
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          # Placeholder - Replace with actual deployment package
+          def remediate(event, context):
+              return {'success': True}
+      Environment:
+        Variables:
+          INCIDENT_TABLE_NAME: !Ref IncidentTrackingTable
+          RESOURCE_LOCK_TABLE_NAME: !Ref ResourceLockTable
+          KNOWLEDGE_BASE_BUCKET: !Ref KnowledgeBaseBucket
+
+  ServiceRemediationLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - ServiceRemediationLambdaLogGroup
+    Properties:
+      FunctionName: ServiceRemediationLambda
+      Runtime: python3.11
+      Handler: src.remediation.service_health_remediation.remediate
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          # Placeholder - Replace with actual deployment package
+          def remediate(event, context):
+              return {'success': True}
+      Environment:
+        Variables:
+          INCIDENT_TABLE_NAME: !Ref IncidentTrackingTable
+          RESOURCE_LOCK_TABLE_NAME: !Ref ResourceLockTable
+          KNOWLEDGE_BASE_BUCKET: !Ref KnowledgeBaseBucket
+
+  # Step Functions State Machine
+  RemediationStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: RemediationStateMachine
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Incident Remediation State Machine",
+          "StartAt": "PatternMatcher",
+          "States": {
+            "PatternMatcher": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${PatternMatcherLambda.Arn}",
+                "Payload": {
+                  "incident.$": "$.incident"
+                }
+              },
+              "ResultPath": "$.pattern_result",
+              "Next": "RouteByPattern"
+            },
+            "RouteByPattern": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.pattern_result.Payload.pattern",
+                  "StringEquals": "EC2 CPU/Memory Spike",
+                  "Next": "RemediateEC2"
+                },
+                {
+                  "Variable": "$.pattern_result.Payload.pattern",
+                  "StringEquals": "Lambda Timeout",
+                  "Next": "RemediateLambda"
+                },
+                {
+                  "Variable": "$.pattern_result.Payload.pattern",
+                  "StringEquals": "SSL Certificate Error",
+                  "Next": "RemediateSSL"
+                },
+                {
+                  "Variable": "$.pattern_result.Payload.pattern",
+                  "StringEquals": "Network Timeout",
+                  "Next": "RemediateNetwork"
+                },
+                {
+                  "Variable": "$.pattern_result.Payload.pattern",
+                  "StringEquals": "Deployment Failure",
+                  "Next": "RemediateDeployment"
+                },
+                {
+                  "Variable": "$.pattern_result.Payload.pattern",
+                  "StringEquals": "Service Unhealthy/Crash",
+                  "Next": "RemediateService"
+                }
+              ],
+              "Default": "EscalateIncident"
+            },
+            "RemediateEC2": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${EC2RemediationLambda.Arn}",
+                "Payload": {
+                  "incident.$": "$.incident"
+                }
+              },
+              "ResultPath": "$.remediation_result",
+              "Next": "NotifySuccess"
+            },
+            "RemediateLambda": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${LambdaRemediationLambda.Arn}",
+                "Payload": {
+                  "incident.$": "$.incident"
+                }
+              },
+              "ResultPath": "$.remediation_result",
+              "Next": "NotifySuccess"
+            },
+            "RemediateSSL": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${SSLRemediationLambda.Arn}",
+                "Payload": {
+                  "incident.$": "$.incident"
+                }
+              },
+              "ResultPath": "$.remediation_result",
+              "Next": "NotifySuccess"
+            },
+            "RemediateNetwork": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${NetworkRemediationLambda.Arn}",
+                "Payload": {
+                  "incident.$": "$.incident"
+                }
+              },
+              "ResultPath": "$.remediation_result",
+              "Next": "NotifySuccess"
+            },
+            "RemediateDeployment": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${DeploymentRemediationLambda.Arn}",
+                "Payload": {
+                  "incident.$": "$.incident"
+                }
+              },
+              "ResultPath": "$.remediation_result",
+              "Next": "NotifySuccess"
+            },
+            "RemediateService": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ServiceRemediationLambda.Arn}",
+                "Payload": {
+                  "incident.$": "$.incident"
+                }
+              },
+              "ResultPath": "$.remediation_result",
+              "Next": "NotifySuccess"
+            },
+            "EscalateIncident": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${IncidentUrgentTopic}",
+                "Subject": "ESCALATION: Unknown Incident Pattern",
+                "Message.$": "$.incident"
+              },
+              "End": true
+            },
+            "NotifySuccess": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${IncidentSummaryTopic}",
+                "Subject": "Incident Remediation Successful",
+                "Message.$": "$.remediation_result"
+              },
+              "End": true
+            }
+          }
+        }
+
+  # CloudWatch Alarms
+  HighRemediationFailureRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: HighRemediationFailureRate
+      AlarmDescription: High remediation failure rate detected
+      MetricName: RemediationFailureRate
+      Namespace: IncidentManagement
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0.5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref IncidentUrgentTopic
+
+  HighDLQMessageCountAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: HighDLQMessageCount
+      AlarmDescription: High number of messages in DLQ
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt IncidentDLQ.QueueName
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref IncidentUrgentTopic
+
+  IngestionLambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: IngestionLambdaErrors
+      AlarmDescription: High error rate in ingestion Lambda
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IngestionLambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref IncidentUrgentTopic
+
+  HighProcessingLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: HighProcessingLatency
+      AlarmDescription: High incident processing latency
+      MetricName: ProcessingLatency
+      Namespace: IncidentManagement
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 30000
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref IncidentUrgentTopic
+
+  HighEscalationRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: HighEscalationRate
+      AlarmDescription: High incident escalation rate
+      MetricName: EscalationRate
+      Namespace: IncidentManagement
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0.3
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref IncidentUrgentTopic
+
+Outputs:
+  IncidentTableName:
+    Description: DynamoDB Incident Tracking Table Name
+    Value: !Ref IncidentTrackingTable
+    Export:
+      Name: !Sub '${AWS::StackName}-IncidentTableName'
+
+  ResourceLockTableName:
+    Description: DynamoDB Resource Lock Table Name
+    Value: !Ref ResourceLockTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ResourceLockTableName'
+
+  KnowledgeBaseBucketName:
+    Description: S3 Knowledge Base Bucket Name
+    Value: !Ref KnowledgeBaseBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-KnowledgeBaseBucketName'
+
+  IngestionLambdaArn:
+    Description: Ingestion Lambda Function ARN
+    Value: !GetAtt IngestionLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IngestionLambdaArn'
+
+  StateMachineArn:
+    Description: Remediation State Machine ARN
+    Value: !Ref RemediationStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachineArn'
+
+  SummaryTopicArn:
+    Description: Summary Notifications Topic ARN
+    Value: !Ref IncidentSummaryTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SummaryTopicArn'
+
+  UrgentTopicArn:
+    Description: Urgent Alerts Topic ARN
+    Value: !Ref IncidentUrgentTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-UrgentTopicArn'
+
+  DLQUrl:
+    Description: Dead Letter Queue URL
+    Value: !Ref IncidentDLQ
+    Export:
+      Name: !Sub '${AWS::StackName}-DLQUrl'
+
+  UpdateIngestionLambdaCommand:
+    Description: Run this command to update IngestionLambda with StateMachine ARN
+    Value: !Sub |
+      aws lambda update-function-configuration --function-name IngestionLambda --environment "Variables={INCIDENT_TABLE_NAME=${IncidentTrackingTable},RESOURCE_LOCK_TABLE_NAME=${ResourceLockTable},KNOWLEDGE_BASE_BUCKET=${KnowledgeBaseBucket},SUMMARY_TOPIC_ARN=${IncidentSummaryTopic},URGENT_TOPIC_ARN=${IncidentUrgentTopic},DLQ_URL=${IncidentDLQ},STATE_MACHINE_ARN=${RemediationStateMachine},BEDROCK_AGENT_MODEL=${BedrockAgentModel},BEDROCK_EMBEDDING_MODEL=${BedrockEmbeddingModel},BEDROCK_SUMMARY_MODEL=${BedrockSummaryModel}}"
